@@ -21,6 +21,12 @@ import org.eclipse.milo.opcua.stack.core.types.structured.EndpointDescription;
 import org.eclipse.milo.opcua.stack.core.types.structured.MonitoredItemCreateRequest;
 import org.eclipse.milo.opcua.stack.core.types.structured.MonitoringParameters;
 import org.eclipse.milo.opcua.stack.core.types.structured.ReadValueId;
+import org.eclipse.milo.opcua.stack.core.types.structured.HistoryData;
+import org.eclipse.milo.opcua.stack.core.types.structured.HistoryReadDetails;
+import org.eclipse.milo.opcua.stack.core.types.structured.HistoryReadResult;
+import org.eclipse.milo.opcua.stack.core.types.structured.HistoryReadValueId;
+import org.eclipse.milo.opcua.stack.core.types.structured.ReadRawModifiedDetails;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DateTime;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
@@ -33,10 +39,14 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte;
 
 @Slf4j
 @Component
 public class OpcUaCollector implements CommandLineRunner {
+
+    @Autowired
+    private TdengineWriter tdengineWriter;
 
     @Autowired
     private IotProperties iotProperties;
@@ -78,6 +88,9 @@ public class OpcUaCollector implements CommandLineRunner {
                     client.connect().get();
                     log.info("OPC UA 客户端连接成功!");
 
+                    // 1.5 历史数据自动补数
+                    backfillHistoryDataIfEnabled();
+
                     // 2. 订阅节点
                     subscribeToNode();
                     connected = true;
@@ -94,9 +107,142 @@ public class OpcUaCollector implements CommandLineRunner {
         });
     }
 
+    private void backfillHistoryDataIfEnabled() {
+        if (!iotProperties.getOpcua().isHistoryBackfillEnabled()) {
+            log.info("历史数据自动补回功能已禁用。");
+            return;
+        }
+
+        log.info("开始检查并执行 OPC UA 历史数据自动补数...");
+        String deviceName = "simulation_server";
+        String metricName = "counter";
+
+        // 1. 查询数据库中最新记录的时间戳
+        Long latestTs = tdengineWriter.getLatestTimestamp(deviceName, metricName);
+        long startTimeMs;
+        long endTimeMs = System.currentTimeMillis();
+
+        if (latestTs != null) {
+            startTimeMs = latestTs + 1; // 从最新一条数据的下一毫秒开始
+            log.info("检测到数据库中最新数据时间戳: {} (millis={})，将拉取该时间点之后的历史数据。", new java.util.Date(latestTs), latestTs);
+        } else {
+            // 如果库中无数据，回溯 maxLookbackHours 小时
+            int lookbackHours = iotProperties.getOpcua().getMaxLookbackHours();
+            startTimeMs = endTimeMs - TimeUnit.HOURS.toMillis(lookbackHours);
+            log.info("数据库中无历史数据，将回溯最近 {} 小时的数据作为历史补充。", lookbackHours);
+        }
+
+        if (startTimeMs >= endTimeMs) {
+            log.info("起止时间不满足补数条件 (startTime >= endTime)，跳过补数。");
+            return;
+        }
+
+        try {
+            NodeId nodeId = NodeId.parse(iotProperties.getOpcua().getNodeId());
+            // 2. 构造历史读取参数
+            ReadRawModifiedDetails readDetails = new ReadRawModifiedDetails(
+                    false, // 读取原始数据
+                    new DateTime(new java.util.Date(startTimeMs)),
+                    new DateTime(new java.util.Date(endTimeMs)),
+                    uint(1000), // 每页最大条数
+                    true  // 返回边界
+            );
+
+            HistoryReadValueId valueId = new HistoryReadValueId(
+                    nodeId,
+                    null,
+                    null,
+                    null // 初始 ContinuationPoint 为 null
+            );
+
+            int totalCount = 0;
+            boolean hasMore = true;
+            org.eclipse.milo.opcua.stack.core.types.builtin.ByteString continuationPoint = null;
+
+            while (hasMore) {
+                if (continuationPoint != null) {
+                    valueId = new HistoryReadValueId(
+                            nodeId,
+                            null,
+                            null,
+                            continuationPoint
+                    );
+                }
+
+                org.eclipse.milo.opcua.stack.core.types.structured.HistoryReadResponse response = client.historyRead(
+                        readDetails,
+                        TimestampsToReturn.Both,
+                        false,
+                        Collections.singletonList(valueId)
+                ).get();
+
+                if (response == null || response.getResults() == null || response.getResults().length == 0) {
+                    break;
+                }
+
+                HistoryReadResult result = response.getResults()[0];
+                if (result.getStatusCode().isBad()) {
+                    log.warn("读取历史数据返回异常状态码: {}", result.getStatusCode());
+                    break;
+                }
+
+                HistoryData historyData = (HistoryData) result.getHistoryData().decode(
+                        client.getStaticSerializationContext()
+                );
+
+                DataValue[] dataValues = historyData.getDataValues();
+                if (dataValues != null && dataValues.length > 0) {
+                    for (DataValue value : dataValues) {
+                        if (value.getValue().getValue() == null) {
+                            continue;
+                        }
+
+                        Object val = value.getValue().getValue();
+                        double doubleVal;
+                        if (val instanceof Number) {
+                            doubleVal = ((Number) val).doubleValue();
+                        } else {
+                            try {
+                                doubleVal = Double.parseDouble(val.toString());
+                            } catch (NumberFormatException e) {
+                                continue;
+                            }
+                        }
+
+                        // 历史数据的时间戳
+                        long timestamp = value.getSourceTime() != null ? 
+                                value.getSourceTime().getJavaTime() : 
+                                (value.getServerTime() != null ? value.getServerTime().getJavaTime() : System.currentTimeMillis());
+
+                        // 直接调用 tdengineWriter 写入数据库，保证效率和数据的即时性
+                        tdengineWriter.write(timestamp, doubleVal, deviceName, metricName);
+                        totalCount++;
+                    }
+                }
+
+                continuationPoint = result.getContinuationPoint();
+                hasMore = continuationPoint != null && continuationPoint.length() > 0;
+            }
+
+            // 冲刷一下写入器缓冲区，保证补回的数据立即入库
+            tdengineWriter.flush();
+            log.info("历史数据自动补数完成，共成功补充写入 {} 条数据。", totalCount);
+
+        } catch (Exception e) {
+            log.error("执行历史数据补数发生异常（若 OPC UA 服务端不支持 HA 历史服务属正常现象，将直接开启实时订阅）: ", e);
+        }
+    }
+
     private void subscribeToNode() throws InterruptedException, ExecutionException {
-        // 创建订阅，采样周期设置为 1000ms
-        UaSubscription subscription = client.getSubscriptionManager().createSubscription(1000.0).get();
+        // 创建订阅，设置自定义的生命周期参数增强订阅耐久性
+        UaSubscription subscription = client.getSubscriptionManager().createSubscription(
+                1000.0, // 采样周期 1000ms
+                uint(iotProperties.getOpcua().getSubscriptionLifetimeCount()),
+                uint(iotProperties.getOpcua().getSubscriptionMaxKeepAliveCount()),
+                uint(0),
+                true,
+                ubyte(0)
+        ).get();
 
         NodeId nodeId = NodeId.parse(iotProperties.getOpcua().getNodeId());
         ReadValueId readValueId = new ReadValueId(
@@ -121,8 +267,6 @@ public class OpcUaCollector implements CommandLineRunner {
                 parameters
         );
 
-        /* * ======= 🔧 修改这里的挂载逻辑 =======
-         */
         // 1. 创建时不传那个不靠谱的第三参数 Lambda
         List<UaMonitoredItem> items = subscription.createMonitoredItems(
                 TimestampsToReturn.Both,

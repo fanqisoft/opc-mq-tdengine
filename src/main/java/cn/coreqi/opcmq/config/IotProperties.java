@@ -18,6 +18,10 @@ public class IotProperties {
         private String serverUrl;
         private String nodeId;
         private String clientName;
+        private boolean historyBackfillEnabled = true;
+        private int maxLookbackHours = 24;
+        private int subscriptionLifetimeCount = 600;
+        private int subscriptionMaxKeepAliveCount = 10;
     }
 
     @Data

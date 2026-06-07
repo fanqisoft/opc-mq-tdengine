@@ -33,6 +33,10 @@ iot:
     server-url: opc.tcp://Coreqi:53530/OPCUA/SimulationServer
     node-id: ns=3;i=1001
     client-name: MiloOPCUAClient
+    history-backfill-enabled: true
+    max-lookback-hours: 24
+    subscription-lifetime-count: 600
+    subscription-max-keep-alive-count: 10
 
   # MQTT 配置
   mqtt:

@@ -149,6 +149,29 @@ public class TdengineWriter {
         }
     }
 
+    /**
+     * 获取指定子表（由设备名称和指标名称组合生成）中的最新数据时间戳。
+     * 如果子表不存在或没有数据，则返回 null。
+     */
+    public Long getLatestTimestamp(String deviceName, String metricName) {
+        String tableName = "d_" + deviceName.toLowerCase().replaceAll("[^a-z0-9_]", "_")
+                + "_" + metricName.toLowerCase().replaceAll("[^a-z0-9_]", "_");
+        String sql = "SELECT MAX(ts) AS max_ts FROM iot_data.`" + tableName + "`";
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery(sql)) {
+            if (rs.next()) {
+                java.sql.Timestamp ts = rs.getTimestamp("max_ts");
+                if (ts != null) {
+                    return ts.getTime();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("查询 TDengine 最新时间戳失败，可能表还不存在: {}", e.getMessage());
+        }
+        return null;
+    }
+
     @PreDestroy
     public void shutdown() {
         log.info("正在关闭 TDengine 写入服务，冲刷剩余数据...");
